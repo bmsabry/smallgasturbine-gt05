@@ -1,67 +1,147 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as auth from "./auth";
 import * as P from "./progress";
+import * as api from "./api.js";
 import { COURSE_META, SECTIONS, SUMMATIVE, REFERENCE_ENGINE, findConcept } from "./content.js";
+import Instructor from "./instructor.jsx";
+
+const CONTACT_EMAIL = "info@proreadyengineer.com";
+const MODULE_ID = "gt-05";
 
 // ─────────────────────────────────────────────────────────────────────────
 // Top-level state machine
 //   "login"     — auth gate
-//   "needs"     — needs-analysis intake (Section 1 of the instructional framework)
-//   "overview"  — module landing page with section list + dashboard
-//   "section"   — drill into a specific section's cards + probes
-//   "calculator"— KJ-66 worked-example calculator
-//   "quiz"      — summative assessment
-//   "dashboard" — progress + spaced-repetition review schedule
+//   "checking"  — fetching access status
+//   "accept"    — handling ?token=xxx invitation URL
+//   "awaiting"  — signed in but not enrolled
+//   "needs"     — needs-analysis intake
+//   "overview"  — module landing page
+//   "section"   — drill into a section
+//   "calculator", "quiz", "dashboard", "instructor" — auxiliary views
 // ─────────────────────────────────────────────────────────────────────────
+
+function getUrlToken() {
+  try {
+    const u = new URL(window.location.href);
+    return u.searchParams.get("token");
+  } catch { return null; }
+}
+
+function clearUrlToken() {
+  try {
+    const u = new URL(window.location.href);
+    u.searchParams.delete("token");
+    const newPath = u.pathname + (u.searchParams.toString() ? "?" + u.searchParams.toString() : "");
+    window.history.replaceState({}, "", newPath);
+  } catch {}
+}
 
 export default function App() {
   const [user, setUser] = useState(auth.getCachedUser());
   const [view, setView] = useState("login");
   const [activeSectionId, setActiveSectionId] = useState(null);
-  const [progress, setProgressLocal] = useState(() =>
-    user ? P.loadProgress(user.email) : null
-  );
+  const [progress, setProgressLocal] = useState(null);
+  const [access, setAccess] = useState(null); // {enrolled, has_pending_invitation, is_admin}
+  const [bootError, setBootError] = useState(null);
+  // remember the invitation token across the auth flow
+  const pendingToken = useRef(getUrlToken());
 
   // refresh /me on mount to validate the stored token
   useEffect(() => {
     let cancelled = false;
     if (auth.getToken()) {
       auth.fetchMe()
-        .then((me) => { if (!cancelled) { setUser(me); setProgressLocal(P.loadProgress(me.email)); } })
+        .then((me) => { if (!cancelled) setUser(me); })
         .catch(() => { auth.clearAuth(); if (!cancelled) setUser(null); });
     }
     return () => { cancelled = true; };
   }, []);
 
-  // decide initial view once user is known
+  // When user changes, decide where to go
   useEffect(() => {
     if (!user) { setView("login"); return; }
-    const p = P.loadProgress(user.email);
-    setProgressLocal(p);
-    if (!p.needs) setView("needs");
-    else setView("overview");
+    (async () => {
+      setView("checking");
+      // If there's a pending invitation token in the URL, try to accept it first.
+      if (pendingToken.current) {
+        try {
+          await api.acceptInvitation(pendingToken.current);
+        } catch (e) {
+          setBootError(e.message || String(e));
+          pendingToken.current = null;
+          clearUrlToken();
+          // Continue to access check regardless — they might still be enrolled.
+        }
+        if (!bootError) {
+          pendingToken.current = null;
+          clearUrlToken();
+        }
+      }
+      let a;
+      try { a = await api.getAccess(); } catch (e) { setBootError(e.message || String(e)); return; }
+      setAccess(a);
+      if (!a.enrolled) {
+        setView("awaiting");
+        return;
+      }
+      // Enrolled — load progress and route to needs or overview
+      try {
+        const p = await P.loadProgress(user.email);
+        setProgressLocal(p);
+        setView(p.needs ? "overview" : "needs");
+      } catch (e) {
+        if (e.status === 403) {
+          setView("awaiting");
+        } else {
+          setBootError(e.message || String(e));
+        }
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.email]);
 
-  const refreshProgress = () => setProgressLocal(P.loadProgress(user.email));
+  const refreshProgress = () => setProgressLocal(P.getCached(user.email));
 
   if (!user) {
-    return <LoginGate onSignedIn={(u) => setUser(u)} />;
+    return <LoginGate onSignedIn={(u) => setUser(u)} pendingToken={pendingToken.current} />;
   }
 
   return (
     <>
       <TopBar
         user={user}
-        onHome={() => setView("overview")}
-        onSignOut={() => { auth.signOut(); setUser(null); }}
+        access={access}
+        onHome={() => view !== "instructor" && setView("overview")}
+        onInstructor={() => setView("instructor")}
+        onSignOut={async () => {
+          if (user?.email) await P.flush(user.email);
+          auth.signOut();
+          setUser(null);
+        }}
       />
       <main className="fade-in">
+        {bootError && (
+          <div className="shell"><div className="card" style={{ borderColor: "var(--bad)" }}>
+            <h3 style={{ color: "var(--bad)" }}>Something went wrong</h3>
+            <div className="small">{bootError}</div>
+            <div className="btn-row"><button className="btn btn-ghost" onClick={() => { setBootError(null); window.location.reload(); }}>Reload</button></div>
+          </div></div>
+        )}
+        {view === "checking" && !bootError && <LoadingShell />}
+        {view === "awaiting" && (
+          <AwaitingAccess
+            user={user}
+            access={access}
+            onRequestAccess={async () => { try { await api.requestAccess(); const a = await api.getAccess(); setAccess(a); } catch (e) { alert(e.message); }}}
+            onOpenInstructor={() => setView("instructor")}
+          />
+        )}
         {view === "needs" && (
           <NeedsAnalysis
             onSubmit={(needs) => { P.recordNeeds(user.email, needs); refreshProgress(); setView("overview"); }}
           />
         )}
-        {view === "overview" && (
+        {view === "overview" && progress && (
           <Overview
             progress={progress}
             onOpenSection={(sid) => { setActiveSectionId(sid); P.startSection(user.email, sid); refreshProgress(); setView("section"); }}
@@ -71,7 +151,7 @@ export default function App() {
             needs={progress?.needs}
           />
         )}
-        {view === "section" && activeSectionId && (
+        {view === "section" && activeSectionId && progress && (
           <SectionView
             section={SECTIONS.find((s) => s.id === activeSectionId)}
             email={user.email}
@@ -83,11 +163,14 @@ export default function App() {
         {view === "calculator" && (
           <Calculator onBack={() => setView("overview")} />
         )}
-        {view === "quiz" && (
+        {view === "quiz" && progress && (
           <Quiz onSubmit={(score, total, byItem) => { P.recordSummative(user.email, score, total, byItem); refreshProgress(); }} onBack={() => setView("overview")} />
         )}
-        {view === "dashboard" && (
+        {view === "dashboard" && progress && (
           <Dashboard email={user.email} progress={progress} onBack={() => setView("overview")} />
+        )}
+        {view === "instructor" && access?.is_admin && (
+          <Instructor onBack={() => setView(progress ? "overview" : "awaiting")} />
         )}
       </main>
       <Footer />
@@ -96,9 +179,7 @@ export default function App() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// TopBar
-// ─────────────────────────────────────────────────────────────────────────
-function TopBar({ user, onHome, onSignOut }) {
+function TopBar({ user, access, onHome, onInstructor, onSignOut }) {
   return (
     <header className="topbar">
       <h1 onClick={onHome} style={{ cursor: "pointer" }}>
@@ -108,6 +189,11 @@ function TopBar({ user, onHome, onSignOut }) {
         </span>
       </h1>
       <div className="user-chip">
+        {access?.is_admin && (
+          <button onClick={onInstructor} style={{ borderColor: "var(--accent)", color: "var(--accent)" }}>
+            Instructor panel
+          </button>
+        )}
         <span className="mono">{user.email}</span>
         <button onClick={onSignOut}>Sign out</button>
       </div>
@@ -119,16 +205,24 @@ function Footer() {
   return (
     <footer className="footer shell">
       <div>© ProReadyEngineer LLC — Proprietary course content. Do not redistribute.</div>
-      <div className="dim small">Powered by the combustion-toolkit API</div>
+      <div className="dim small">Questions? <a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a></div>
     </footer>
   );
 }
 
+function LoadingShell() {
+  return (
+    <div className="shell fade-in">
+      <div className="card center">
+        <div className="muted small">Loading your course…</div>
+      </div>
+    </div>
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
-// Login gate — calls combustion-toolkit-api JWT endpoints
-// ─────────────────────────────────────────────────────────────────────────
-function LoginGate({ onSignedIn }) {
-  const [mode, setMode] = useState("login"); // "login" | "signup"
+function LoginGate({ onSignedIn, pendingToken }) {
+  const [mode, setMode] = useState("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [fullName, setFullName] = useState("");
@@ -137,18 +231,14 @@ function LoginGate({ onSignedIn }) {
 
   const submit = async (e) => {
     e.preventDefault();
-    setErr(null);
-    setBusy(true);
+    setErr(null); setBusy(true);
     try {
       const me = mode === "login"
         ? await auth.login(email, password)
         : await auth.signup(email, password, fullName);
       onSignedIn(me);
-    } catch (ex) {
-      setErr(ex.message || String(ex));
-    } finally {
-      setBusy(false);
-    }
+    } catch (ex) { setErr(ex.message || String(ex)); }
+    finally { setBusy(false); }
   };
 
   return (
@@ -158,9 +248,11 @@ function LoginGate({ onSignedIn }) {
           <span>{COURSE_META.code}</span> — Centrifugal Compressor
         </div>
         <div className="tag">
-          {mode === "login"
-            ? "Sign in with your ProReadyEngineer account to start the module."
-            : "Create a free ProReadyEngineer account to begin."}
+          {pendingToken
+            ? "You've been invited! Sign in (or create an account with the invited email) to accept."
+            : (mode === "login"
+              ? "Sign in with your ProReadyEngineer account to start the module."
+              : "Create a free ProReadyEngineer account to begin.")}
         </div>
         {mode === "signup" && (
           <div className="field">
@@ -197,7 +289,51 @@ function LoginGate({ onSignedIn }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Needs Analysis (instructional-framework Section 1)
+function AwaitingAccess({ user, access, onRequestAccess, onOpenInstructor }) {
+  return (
+    <div className="shell fade-in">
+      <div className="card">
+        <h2>This module is by invitation only.</h2>
+        <p>
+          You're signed in as <span className="mono">{user.email}</span>, but this email isn't on the access list for{" "}
+          <b>{COURSE_META.title}</b>.
+        </p>
+        {access?.has_pending_invitation && (
+          <div className="probe-feedback correct">
+            ✓ You have a pending invitation. Use the link in the invitation email — it activates access on click. If you've lost it, request a new one below.
+          </div>
+        )}
+        {access?.has_pending_request ? (
+          <div className="probe-feedback" style={{ background: "rgba(250,204,21,.08)", border: "1px solid rgba(250,204,21,.4)" }}>
+            ⏳ Your access request has been recorded. The instructor will review it and reach out at <span className="mono">{user.email}</span>.
+          </div>
+        ) : (
+          <p>
+            If you believe you should have access (e.g. you've paid, or you're enrolled in a cohort), let the instructor know.
+          </p>
+        )}
+        <div className="btn-row">
+          {!access?.has_pending_request && (
+            <button className="btn btn-primary" onClick={onRequestAccess}>Request access</button>
+          )}
+          <a className="btn btn-ghost" href={`mailto:${CONTACT_EMAIL}?subject=GT-05%20access%20request%20for%20${encodeURIComponent(user.email)}`}>
+            Email {CONTACT_EMAIL}
+          </a>
+          {access?.is_admin && (
+            <button className="btn btn-secondary" onClick={onOpenInstructor}>
+              Open instructor panel →
+            </button>
+          )}
+        </div>
+      </div>
+      <div className="card">
+        <h3>What is this?</h3>
+        <p className="muted small">{COURSE_META.title} is a {COURSE_META.durationMin}-minute interactive learning module from ProReadyEngineer's Small Jet Engine Design Training. It walks through impeller aerodynamics, velocity triangles, slip factor, compressor mapping, stall vs surge, and a worked KJ-66 example. Designed for engineers who want to go from "I've heard of centrifugal compressors" to "I can size and analyse one for a 700 N-class turbojet."</p>
+      </div>
+    </div>
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 function NeedsAnalysis({ onSubmit }) {
   const [level, setLevel] = useState("");
@@ -205,9 +341,7 @@ function NeedsAnalysis({ onSubmit }) {
   const [time, setTime] = useState("");
   const [modality, setModality] = useState("");
   const [obstacles, setObstacles] = useState("");
-
   const canSubmit = level && goal && time && modality;
-
   return (
     <div className="shell fade-in">
       <div className="card">
@@ -293,13 +427,9 @@ function Choices({ value, onChange, opts }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Overview — module landing page
-// ─────────────────────────────────────────────────────────────────────────
 function Overview({ progress, onOpenSection, onOpenCalculator, onOpenQuiz, onOpenDashboard, needs }) {
-  const stats = useMemo(() => P.overallStats(progress?.userEmail || "", SECTIONS.length) /* unused — recompute below */, [progress]);
   const completedSet = useMemo(() => new Set(Object.keys(progress?.sectionState || {}).filter(sid => progress.sectionState[sid].completedAt)), [progress]);
 
-  // Section is "available" if it's the first one OR the previous section is completed.
   const isAvailable = (idx) => {
     if (idx === 0) return true;
     const prev = SECTIONS[idx - 1];
@@ -307,7 +437,6 @@ function Overview({ progress, onOpenSection, onOpenCalculator, onOpenQuiz, onOpe
   };
 
   const completed = completedSet.size;
-  const totalProbes = SECTIONS.reduce((n, s) => n + s.probes.length, 0);
   let probeCorrect = 0, probeTotal = 0;
   for (const sid of Object.keys(progress?.sectionState || {})) {
     const ss = progress.sectionState[sid];
@@ -395,11 +524,8 @@ function Overview({ progress, onOpenSection, onOpenCalculator, onOpenQuiz, onOpe
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Section view — cards + probes
-// ─────────────────────────────────────────────────────────────────────────
 function SectionView({ section, email, onProbeAnswer, onComplete, onBack }) {
-  const [probeState, setProbeState] = useState({}); // { [probeId]: { selected, answered, correct } }
-
+  const [probeState, setProbeState] = useState({});
   const probeStat = (pid) => probeState[pid] || { selected: null, answered: false };
   const allAnswered = section.probes.every((p) => probeStat(p.id).answered);
   const correctCount = section.probes.filter((p) => probeStat(p.id).correct).length;
@@ -488,9 +614,6 @@ function SectionView({ section, email, onProbeAnswer, onComplete, onBack }) {
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Probe — single MCQ with mastery feedback
-// ─────────────────────────────────────────────────────────────────────────
 function Probe({ probe, state, onSelect, onRetry }) {
   const tagLabel = probe.kind || "concept";
   return (
@@ -528,12 +651,10 @@ function Probe({ probe, state, onSelect, onRetry }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Calculator — KJ-66 / reference-engine worked example
-// ─────────────────────────────────────────────────────────────────────────
 function Calculator({ onBack }) {
   const [D_mm, setD] = useState(66);
   const [N_rpm, setN] = useState(115000);
-  const [beta2_prime_deg, setBeta] = useState(25); // measured from radial direction
+  const [beta2_prime_deg, setBeta] = useState(25);
   const [z, setZ] = useState(15);
   const [mDot, setMDot] = useState(0.5);
   const [gap_mm, setGap] = useState(0.4);
@@ -541,27 +662,21 @@ function Calculator({ onBack }) {
 
   const D = D_mm / 1000;
   const U2 = (Math.PI * D * N_rpm) / 60;
-  const a = Math.sqrt(1.4 * 287 * T01_K); // speed of sound at T01
+  const a = Math.sqrt(1.4 * 287 * T01_K);
   const M2 = U2 / a;
   const sigma = Math.max(0, 1 - Math.sqrt(Math.sin(beta2_prime_deg * Math.PI / 180)) / Math.pow(Math.max(1, z), 0.7));
-  // axial inlet, w = sigma * U2 * U2 * cos(beta2_prime)  approximate; for radial blade beta2'=0 → cos=1, work=sigma*U2^2
   const Cu2 = sigma * U2 * Math.cos(beta2_prime_deg * Math.PI / 180);
-  const w = U2 * Cu2; // J/kg
-  const P_shaft = mDot * w; // W
-
-  // Crude PR estimate: from total work via isentropic relation with assumed efficiency
-  const cp = 1005, gamma = 1.4;
-  const eta = 0.78;
-  const T03 = T01_K + w / cp; // total-to-total temperature rise (no slip into stagnation rise here is approx)
+  const w = U2 * Cu2;
+  const P_shaft = mDot * w;
+  const cp = 1005, gamma = 1.4, eta = 0.78;
+  const T03 = T01_K + w / cp;
   const PR_ideal = Math.pow(T03 / T01_K, gamma / (gamma - 1));
   const PR_actual = Math.pow(1 + eta * (T03 / T01_K - 1), gamma / (gamma - 1));
-
   const gapMode = gap_mm < 0.3 ? "bad" : gap_mm <= 0.5 ? "ok" : gap_mm <= 1.0 ? "warn" : "bad";
   const gapMsg = gapMode === "bad" && gap_mm < 0.3 ? "Too tight — rotor will rub on start-up"
               : gapMode === "ok" ? "Inside the 0.3–0.5 mm sweet spot"
               : gapMode === "warn" ? "Above 0.5 mm — efficiency penalty, approaching 1.0 mm cliff"
               : "Beyond 1.0 mm — engine likely cannot sustain rotation";
-
   const M2Cls = M2 < 0.85 ? "" : M2 < 1.0 ? "warn" : "bad";
   const M2Msg = M2 < 0.85 ? "Comfortable subsonic" : M2 < 1.0 ? "High subsonic — edge of shock losses" : "Supersonic tip — shock losses expected";
 
@@ -569,14 +684,14 @@ function Calculator({ onBack }) {
     <div className="shell fade-in">
       <div className="card">
         <h2>Worked example — interactive calculator</h2>
-        <p className="muted small">Defaults are the KJ-66 (66 mm impeller at 115 000 rpm). Change inputs to explore tip Mach, slip-factor, work, PR, and gap-clearance trade-offs. This is the same calculation chain in Section 10 — try the 700 N reference engine: D = 80 mm, N = 80 000 rpm.</p>
+        <p className="muted small">Defaults are the KJ-66 (66 mm impeller at 115 000 rpm). Change inputs to explore tip Mach, slip-factor, work, PR, and gap-clearance trade-offs.</p>
       </div>
       <div className="card">
         <div className="calc-grid">
           <div>
             <div className="field"><label>Impeller diameter D2 (mm)</label><input type="number" step="1" value={D_mm} onChange={(e) => setD(+e.target.value || 0)} /></div>
             <div className="field"><label>Shaft speed N (rpm)</label><input type="number" step="1000" value={N_rpm} onChange={(e) => setN(+e.target.value || 0)} /></div>
-            <div className="field"><label>Blade exit angle β2′ — from radial (deg). Radial blade = 0°, backswept ≈ 25°</label><input type="number" step="1" value={beta2_prime_deg} onChange={(e) => setBeta(+e.target.value || 0)} /></div>
+            <div className="field"><label>Blade exit angle β2′ — from radial (deg). Radial = 0°, backswept ≈ 25°</label><input type="number" step="1" value={beta2_prime_deg} onChange={(e) => setBeta(+e.target.value || 0)} /></div>
             <div className="field"><label>Blade count z</label><input type="number" step="1" value={z} onChange={(e) => setZ(+e.target.value || 0)} /></div>
             <div className="field"><label>Mass flow ṁ (kg/s)</label><input type="number" step="0.05" value={mDot} onChange={(e) => setMDot(+e.target.value || 0)} /></div>
             <div className="field"><label>Tip-clearance gap (mm, cold)</label><input type="number" step="0.05" value={gap_mm} onChange={(e) => setGap(+e.target.value || 0)} /></div>
@@ -599,12 +714,8 @@ function Calculator({ onBack }) {
         </div>
         <div className="btn-row">
           <button className="btn btn-ghost" onClick={onBack}>← Back</button>
-          <button className="btn btn-ghost" onClick={() => { setD(80); setN(80000); setBeta(25); setZ(15); setMDot(0.85); setGap(0.4); setT01(288.15); }}>
-            Load 700 N reference engine
-          </button>
-          <button className="btn btn-ghost" onClick={() => { setD(66); setN(115000); setBeta(25); setZ(15); setMDot(0.5); setGap(0.4); setT01(288.15); }}>
-            Load KJ-66
-          </button>
+          <button className="btn btn-ghost" onClick={() => { setD(80); setN(80000); setBeta(25); setZ(15); setMDot(0.85); setGap(0.4); setT01(288.15); }}>Load 700 N reference engine</button>
+          <button className="btn btn-ghost" onClick={() => { setD(66); setN(115000); setBeta(25); setZ(15); setMDot(0.5); setGap(0.4); setT01(288.15); }}>Load KJ-66</button>
         </div>
       </div>
     </div>
@@ -621,12 +732,9 @@ function Row({ lbl, val, cls = "", small = false }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Summative quiz
-// ─────────────────────────────────────────────────────────────────────────
 function Quiz({ onSubmit, onBack }) {
-  const [picks, setPicks] = useState({}); // { qid: idx }
+  const [picks, setPicks] = useState({});
   const [submitted, setSubmitted] = useState(false);
-
   const allAnswered = SUMMATIVE.every((q) => picks[q.id] != null);
   const score = SUMMATIVE.filter((q) => picks[q.id] === q.correct).length;
   const byItem = Object.fromEntries(SUMMATIVE.map((q) => [q.id, picks[q.id] === q.correct]));
@@ -640,7 +748,7 @@ function Quiz({ onSubmit, onBack }) {
     <div className="shell fade-in">
       <div className="card">
         <h2>Summative quiz</h2>
-        <p className="muted small">{SUMMATIVE.length} items mixing recall, application, analysis, and evaluation. Mostly novel material (not lifted from the cards). Passing benchmark: ≥ 80% on application-and-higher items.</p>
+        <p className="muted small">{SUMMATIVE.length} items mixing recall, application, analysis, and evaluation. Mostly novel material. Passing benchmark: ≥ 80% on application-and-higher items.</p>
       </div>
       {SUMMATIVE.map((q, idx) => {
         const picked = picks[q.id];
@@ -657,8 +765,6 @@ function Quiz({ onSubmit, onBack }) {
                   if (i === q.correct) cls += " correct";
                   else if (i === picked) cls += " incorrect";
                   else cls += " dim";
-                } else if (i === picked) {
-                  cls += "";
                 }
                 return (
                   <label key={i} className={cls} style={{ borderColor: !reveal && picked === i ? "var(--accent)" : undefined, background: !reveal && picked === i ? "rgba(0,212,255,.06)" : undefined }}>
@@ -704,8 +810,6 @@ function Quiz({ onSubmit, onBack }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Dashboard — progress + spaced-repetition review schedule
-// ─────────────────────────────────────────────────────────────────────────
 function Dashboard({ email, progress, onBack }) {
   const stats = P.overallStats(email, SECTIONS.length);
   const reviews = P.dueReviews(email);
@@ -717,24 +821,10 @@ function Dashboard({ email, progress, onBack }) {
       <div className="card">
         <h2>Your progress</h2>
         <div className="kpi-grid">
-          <div className="kpi">
-            <div className="lbl">Sections done</div>
-            <div className="val">{stats.sectionsCompleted}<span className="unit">/ {stats.sectionsTotal}</span></div>
-          </div>
-          <div className="kpi">
-            <div className="lbl">Module complete</div>
-            <div className="val">{stats.pctComplete}<span className="unit">%</span></div>
-          </div>
-          <div className="kpi">
-            <div className="lbl">Probe accuracy</div>
-            <div className="val">{stats.probeAccuracy ?? "—"}<span className="unit">%</span></div>
-          </div>
-          <div className="kpi">
-            <div className="lbl">Summative score</div>
-            <div className="val">
-              {stats.summative ? `${stats.summative.score}/${stats.summative.total}` : "—"}
-            </div>
-          </div>
+          <div className="kpi"><div className="lbl">Sections done</div><div className="val">{stats.sectionsCompleted}<span className="unit">/ {stats.sectionsTotal}</span></div></div>
+          <div className="kpi"><div className="lbl">Module complete</div><div className="val">{stats.pctComplete}<span className="unit">%</span></div></div>
+          <div className="kpi"><div className="lbl">Probe accuracy</div><div className="val">{stats.probeAccuracy ?? "—"}<span className="unit">%</span></div></div>
+          <div className="kpi"><div className="lbl">Summative score</div><div className="val">{stats.summative ? `${stats.summative.score}/${stats.summative.total}` : "—"}</div></div>
         </div>
       </div>
 
@@ -747,10 +837,7 @@ function Dashboard({ email, progress, onBack }) {
           const c = findConcept(r.conceptId);
           return (
             <div className="review-row" key={r.conceptId}>
-              <div>
-                <div><b>{c.label}</b></div>
-                <div className="muted tiny">Streak: {r.streak} · interval: {r.intervalDays}d</div>
-              </div>
+              <div><div><b>{c.label}</b></div><div className="muted tiny">Streak: {r.streak} · interval: {r.intervalDays}d</div></div>
               <div className="due now">DUE</div>
             </div>
           );
@@ -765,10 +852,7 @@ function Dashboard({ email, progress, onBack }) {
           const c = findConcept(r.conceptId);
           return (
             <div className="review-row" key={r.conceptId}>
-              <div>
-                <div><b>{c.label}</b></div>
-                <div className="muted tiny">Streak: {r.streak} · interval: {r.intervalDays}d</div>
-              </div>
+              <div><div><b>{c.label}</b></div><div className="muted tiny">Streak: {r.streak} · interval: {r.intervalDays}d</div></div>
               <div className="due future">in {r.daysUntil}d</div>
             </div>
           );

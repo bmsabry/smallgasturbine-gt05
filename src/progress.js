@@ -1,106 +1,173 @@
-// Per-user learning state in localStorage.
-// Namespaced by user email so two users on the same device don't trample each other.
-// Implements:
-//  - needs-analysis answers
-//  - module completion + per-section accuracy
-//  - quiz results
-//  - spaced-repetition schedule (1d / 3d / 1w / 2w / doubling)
+// API-backed per-user learning state.
+// Replaces the previous localStorage-only implementation. The state shape
+// is identical so all UI code stays the same; this file is the only thing
+// that has to know about persistence.
+//
+// Save strategy: debounced write-through. Updates are applied to an
+// in-memory cache immediately (synchronous reads stay snappy) and then
+// PUT to /learning/gt-05/progress on a short timer (300 ms).
+//
+// First-load migration: if the API returns an empty payload AND there's
+// progress in legacy localStorage for this user, upload that once and
+// clear localStorage so we don't double-source.
+
+import * as api from "./api.js";
 
 const VERSION = 1;
-
-function _key(email) {
-  return `gt05_progress::${(email || "anon").toLowerCase()}`;
-}
+const SAVE_DEBOUNCE_MS = 300;
 
 const DEFAULT_STATE = {
   version: VERSION,
-  needs: null,           // { level, goal, time, modality, obstacles }
-  sectionState: {},      // { [sectionId]: { startedAt, completedAt, probeAttempts: { [probeId]: [boolean,...] }, mastered: bool } }
-  summative: null,       // { takenAt, score, total, byItem: { [itemId]: boolean } }
-  reviews: {},           // { [conceptId]: { lastReviewedAt, nextDueAt, intervalDays, streak } }
-  notes: {},             // { [sectionId]: string }
+  needs: null,
+  sectionState: {},
+  summative: null,
+  reviews: {},
+  notes: {},
 };
 
-const INTERVALS = [1, 3, 7, 14]; // then doubles after index 3
+const INTERVALS = [1, 3, 7, 14];
 
-export function loadProgress(email) {
+// In-memory cache keyed by user email. Holds the live state; flushed to API.
+const _cache = new Map();
+const _pendingTimers = new Map();
+const _legacyKey = (email) => `gt05_progress::${(email || "anon").toLowerCase()}`;
+
+function _clone(s) {
+  return JSON.parse(JSON.stringify(s || DEFAULT_STATE));
+}
+
+function _scheduleSave(email) {
+  const prev = _pendingTimers.get(email);
+  if (prev) clearTimeout(prev);
+  const t = setTimeout(async () => {
+    _pendingTimers.delete(email);
+    const state = _cache.get(email);
+    if (!state) return;
+    try {
+      await api.saveProgress(state);
+    } catch (err) {
+      // Soft fail — keep state in memory; we'll retry on the next update.
+      // eslint-disable-next-line no-console
+      console.warn("[gt05 progress] save failed, will retry on next change:", err.message || err);
+    }
+  }, SAVE_DEBOUNCE_MS);
+  _pendingTimers.set(email, t);
+}
+
+async function _maybeMigrateLegacyLocalStorage(email, currentPayload) {
+  // Only migrate if API has nothing AND localStorage has something
+  const hasApi = currentPayload && Object.keys(currentPayload).length > 0;
+  if (hasApi) return null;
+  let legacy;
   try {
-    const raw = localStorage.getItem(_key(email));
-    if (!raw) return { ...DEFAULT_STATE };
-    const p = JSON.parse(raw);
-    if (!p || p.version !== VERSION) return { ...DEFAULT_STATE };
-    // shallow-merge for forward-compat
-    return { ...DEFAULT_STATE, ...p };
+    const raw = localStorage.getItem(_legacyKey(email));
+    if (!raw) return null;
+    legacy = JSON.parse(raw);
   } catch {
-    return { ...DEFAULT_STATE };
+    return null;
+  }
+  if (!legacy || typeof legacy !== "object") return null;
+  // Upload + clear
+  try {
+    await api.saveProgress(legacy);
+    try { localStorage.removeItem(_legacyKey(email)); } catch {}
+    // eslint-disable-next-line no-console
+    console.info("[gt05 progress] migrated legacy localStorage to API for", email);
+    return legacy;
+  } catch (e) {
+    // Leave localStorage in place; we'll try again next load.
+    // eslint-disable-next-line no-console
+    console.warn("[gt05 progress] legacy migration failed, will retry next load:", e.message || e);
+    return null;
   }
 }
 
-export function saveProgress(email, state) {
-  try { localStorage.setItem(_key(email), JSON.stringify(state)); } catch {}
-  return state;
+// ─── public API (matches the old localStorage module signature) ───────
+export async function loadProgress(email) {
+  let payload;
+  try {
+    payload = await api.fetchProgress();
+  } catch (err) {
+    // If access is denied (403), surface that to caller via thrown error
+    if (err.status === 403) throw err;
+    payload = {};
+  }
+  const migrated = await _maybeMigrateLegacyLocalStorage(email, payload);
+  const state = { ...DEFAULT_STATE, ...(migrated || payload || {}) };
+  _cache.set(email, state);
+  return _clone(state);
+}
+
+export function getCached(email) {
+  return _clone(_cache.get(email) || DEFAULT_STATE);
+}
+
+function _mutate(email, mutator) {
+  const current = _cache.get(email) || _clone(DEFAULT_STATE);
+  const next = _clone(current);
+  mutator(next);
+  _cache.set(email, next);
+  _scheduleSave(email);
+  return _clone(next);
 }
 
 export function recordNeeds(email, needs) {
-  const p = loadProgress(email);
-  p.needs = { ...needs, completedAt: Date.now() };
-  return saveProgress(email, p);
+  return _mutate(email, (s) => { s.needs = { ...needs, completedAt: Date.now() }; });
 }
 
 export function startSection(email, sectionId) {
-  const p = loadProgress(email);
-  if (!p.sectionState[sectionId]) {
-    p.sectionState[sectionId] = { startedAt: Date.now(), probeAttempts: {}, mastered: false };
-  }
-  return saveProgress(email, p);
+  return _mutate(email, (s) => {
+    if (!s.sectionState[sectionId]) {
+      s.sectionState[sectionId] = { startedAt: Date.now(), probeAttempts: {}, mastered: false };
+    }
+  });
 }
 
 export function recordProbe(email, sectionId, probeId, correct) {
-  const p = loadProgress(email);
-  if (!p.sectionState[sectionId]) p.sectionState[sectionId] = { startedAt: Date.now(), probeAttempts: {}, mastered: false };
-  const s = p.sectionState[sectionId];
-  if (!s.probeAttempts[probeId]) s.probeAttempts[probeId] = [];
-  s.probeAttempts[probeId].push(!!correct);
-  // schedule a review for this concept on first correct answer
-  if (correct) _scheduleReview(p, probeId, true);
-  return saveProgress(email, p);
+  return _mutate(email, (s) => {
+    if (!s.sectionState[sectionId]) {
+      s.sectionState[sectionId] = { startedAt: Date.now(), probeAttempts: {}, mastered: false };
+    }
+    const sec = s.sectionState[sectionId];
+    if (!sec.probeAttempts[probeId]) sec.probeAttempts[probeId] = [];
+    sec.probeAttempts[probeId].push(!!correct);
+    if (correct) _scheduleReview(s, probeId, true);
+  });
 }
 
 export function completeSection(email, sectionId, mastered = true) {
-  const p = loadProgress(email);
-  if (!p.sectionState[sectionId]) p.sectionState[sectionId] = { startedAt: Date.now(), probeAttempts: {} };
-  p.sectionState[sectionId].completedAt = Date.now();
-  p.sectionState[sectionId].mastered = !!mastered;
-  // schedule a section-level review
-  _scheduleReview(p, `section::${sectionId}`, true);
-  return saveProgress(email, p);
+  return _mutate(email, (s) => {
+    if (!s.sectionState[sectionId]) s.sectionState[sectionId] = { startedAt: Date.now(), probeAttempts: {} };
+    s.sectionState[sectionId].completedAt = Date.now();
+    s.sectionState[sectionId].mastered = !!mastered;
+    _scheduleReview(s, `section::${sectionId}`, true);
+  });
 }
 
 export function recordSummative(email, score, total, byItem) {
-  const p = loadProgress(email);
-  p.summative = { takenAt: Date.now(), score, total, byItem };
-  return saveProgress(email, p);
+  return _mutate(email, (s) => {
+    s.summative = { takenAt: Date.now(), score, total, byItem };
+  });
 }
 
 export function setNote(email, sectionId, text) {
-  const p = loadProgress(email);
-  p.notes[sectionId] = text;
-  return saveProgress(email, p);
+  return _mutate(email, (s) => { s.notes[sectionId] = text; });
 }
 
-function _scheduleReview(p, conceptId, success) {
-  if (!p.reviews) p.reviews = {};
+function _scheduleReview(s, conceptId, success) {
+  if (!s.reviews) s.reviews = {};
   const now = Date.now();
-  const prev = p.reviews[conceptId];
+  const prev = s.reviews[conceptId];
   let streak = success ? (prev ? prev.streak + 1 : 1) : 0;
   let nextInterval;
   if (success) {
-    if (streak <= INTERVALS.length) nextInterval = INTERVALS[streak - 1];
-    else nextInterval = INTERVALS[INTERVALS.length - 1] * Math.pow(2, streak - INTERVALS.length);
+    nextInterval = streak <= INTERVALS.length
+      ? INTERVALS[streak - 1]
+      : INTERVALS[INTERVALS.length - 1] * Math.pow(2, streak - INTERVALS.length);
   } else {
-    nextInterval = 1; // reset to daily
+    nextInterval = 1;
   }
-  p.reviews[conceptId] = {
+  s.reviews[conceptId] = {
     lastReviewedAt: now,
     nextDueAt: now + nextInterval * 24 * 60 * 60 * 1000,
     intervalDays: nextInterval,
@@ -109,9 +176,9 @@ function _scheduleReview(p, conceptId, success) {
 }
 
 export function dueReviews(email) {
-  const p = loadProgress(email);
+  const s = _cache.get(email) || DEFAULT_STATE;
   const now = Date.now();
-  return Object.entries(p.reviews || {})
+  return Object.entries(s.reviews || {})
     .map(([conceptId, r]) => ({ conceptId, ...r }))
     .sort((a, b) => a.nextDueAt - b.nextDueAt)
     .map((r) => ({
@@ -122,9 +189,9 @@ export function dueReviews(email) {
 }
 
 export function overallStats(email, sectionCount) {
-  const p = loadProgress(email);
+  const p = _cache.get(email) || DEFAULT_STATE;
   let completed = 0, totalProbes = 0, correctProbes = 0;
-  for (const sid of Object.keys(p.sectionState)) {
+  for (const sid of Object.keys(p.sectionState || {})) {
     const s = p.sectionState[sid];
     if (s.completedAt) completed++;
     for (const probeId of Object.keys(s.probeAttempts || {})) {
@@ -141,4 +208,13 @@ export function overallStats(email, sectionCount) {
     summative: p.summative,
     needsCompleted: !!p.needs,
   };
+}
+
+// Force-flush any pending writes (used on signout to avoid losing the last edit).
+export async function flush(email) {
+  const t = _pendingTimers.get(email);
+  if (t) { clearTimeout(t); _pendingTimers.delete(email); }
+  const state = _cache.get(email);
+  if (!state) return;
+  try { await api.saveProgress(state); } catch {}
 }
