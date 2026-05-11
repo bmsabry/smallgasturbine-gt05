@@ -148,6 +148,13 @@ export default function App() {
             onOpenCalculator={() => setView("calculator")}
             onOpenQuiz={() => setView("quiz")}
             onOpenDashboard={() => setView("dashboard")}
+            onRestart={() => {
+              if (window.confirm("Restart the entire module? This wipes your needs analysis, section completions, summative quiz score, and review queue. Useful for live demos.\n\nThis cannot be undone.")) {
+                P.resetProgress(user.email);
+                refreshProgress();
+                setView("needs");
+              }
+            }}
             needs={progress?.needs}
           />
         )}
@@ -430,7 +437,7 @@ function Choices({ value, onChange, opts }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-function Overview({ progress, onOpenSection, onOpenCalculator, onOpenQuiz, onOpenDashboard, needs }) {
+function Overview({ progress, onOpenSection, onOpenCalculator, onOpenQuiz, onOpenDashboard, onRestart, needs }) {
   const completedSet = useMemo(() => new Set(Object.keys(progress?.sectionState || {}).filter(sid => progress.sectionState[sid].completedAt)), [progress]);
 
   const isAvailable = (idx) => {
@@ -516,6 +523,14 @@ function Overview({ progress, onOpenSection, onOpenCalculator, onOpenQuiz, onOpe
             title={completed < SECTIONS.length ? "Complete all sections to unlock the summative quiz" : ""}
           >
             {completed < SECTIONS.length ? `Summative quiz (locked — ${SECTIONS.length - completed} sections left)` : "Take the summative quiz"}
+          </button>
+          <button
+            className="btn btn-ghost"
+            onClick={onRestart}
+            style={{ borderColor: "var(--bad)", color: "var(--bad)", marginLeft: "auto" }}
+            title="Wipe all progress and re-take the needs analysis. Useful for live demos."
+          >
+            Restart module
           </button>
         </div>
         {accuracy !== null && (

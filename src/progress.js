@@ -154,6 +154,19 @@ export function setNote(email, sectionId, text) {
   return _mutate(email, (s) => { s.notes[sectionId] = text; });
 }
 
+// Wipe all module progress — needs analysis, sections, summative, reviews,
+// notes. The debounced save flushes the cleared state to the backend.
+// Useful for live demos: instructor resets so students can watch a fresh run.
+export function resetProgress(email) {
+  return _mutate(email, (s) => {
+    s.needs = null;
+    s.sectionState = {};
+    s.summative = null;
+    s.reviews = {};
+    s.notes = {};
+  });
+}
+
 function _scheduleReview(s, conceptId, success) {
   if (!s.reviews) s.reviews = {};
   const now = Date.now();
