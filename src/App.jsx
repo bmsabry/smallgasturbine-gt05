@@ -222,7 +222,10 @@ function LoadingShell() {
 
 // ─────────────────────────────────────────────────────────────────────────
 function LoginGate({ onSignedIn, pendingToken }) {
-  const [mode, setMode] = useState("login");
+  // Default to signup when arriving via an invitation link — invited folks
+  // typically don't have an account yet. They can still toggle to "Sign in"
+  // via the link at the bottom if they're an existing user.
+  const [mode, setMode] = useState(pendingToken ? "signup" : "login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [fullName, setFullName] = useState("");
