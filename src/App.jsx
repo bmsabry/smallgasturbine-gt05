@@ -111,8 +111,9 @@ export default function App() {
       <TopBar
         user={user}
         access={access}
-        onHome={() => view !== "instructor" && setView("overview")}
+        onHome={() => view !== "instructor" && view !== "myCourses" && setView("overview")}
         onInstructor={() => setView("instructor")}
+        onMyCourses={() => setView("myCourses")}
         onSignOut={async () => {
           if (user?.email) await P.flush(user.email);
           auth.signOut();
@@ -176,6 +177,9 @@ export default function App() {
         {view === "dashboard" && progress && (
           <Dashboard email={user.email} progress={progress} onBack={() => setView("overview")} />
         )}
+        {view === "myCourses" && (
+          <MyCourses onBack={() => setView(progress ? "overview" : "awaiting")} />
+        )}
         {view === "instructor" && access?.is_admin && (
           <Instructor onBack={() => setView(progress ? "overview" : "awaiting")} />
         )}
@@ -186,7 +190,7 @@ export default function App() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-function TopBar({ user, access, onHome, onInstructor, onSignOut }) {
+function TopBar({ user, access, onHome, onInstructor, onMyCourses, onSignOut }) {
   return (
     <header className="topbar">
       <h1 onClick={onHome} style={{ cursor: "pointer" }}>
@@ -196,6 +200,9 @@ function TopBar({ user, access, onHome, onInstructor, onSignOut }) {
         </span>
       </h1>
       <div className="user-chip">
+        <button onClick={onMyCourses} title="See all modules you have access to">
+          Your courses
+        </button>
         {access?.is_admin && (
           <button onClick={onInstructor} style={{ borderColor: "var(--accent)", color: "var(--accent)" }}>
             Instructor panel
@@ -294,6 +301,63 @@ function LoginGate({ onSignedIn, pendingToken }) {
           Your ProReadyEngineer account works across <span className="mono">combustion-toolkit.proreadyengineer.com</span> and this learning module.
         </div>
       </form>
+    </div>
+  );
+}
+
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// MyCourses — directory of all modules the user has access to.
+function MyCourses({ onBack }) {
+  const [modules, setModules] = useState(null);
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    api.fetchMyModules().then(setModules).catch((e) => setErr(e.message || String(e)));
+  }, []);
+  return (
+    <div className="shell fade-in">
+      <div className="card">
+        <h2>Your courses</h2>
+        <p className="muted small">All modules you have access to. Click to open the module in a new tab.</p>
+        {err && <div className="probe-feedback incorrect">{err}</div>}
+        {!modules && !err && <div className="muted small">Loading…</div>}
+        {modules && modules.length === 0 && (
+          <div className="muted small">No enrollments yet. Contact <a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a> for access.</div>
+        )}
+        {modules && modules.map((m) => {
+          const ps = m.progress_summary || {};
+          const completed = ps.sections_completed || 0;
+          return (
+            <a
+              key={m.module_id}
+              href={m.url_base + "/"}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ display: "block", textDecoration: "none", color: "inherit" }}
+            >
+              <div className="section-row current" style={{ marginBottom: 10, cursor: "pointer" }}>
+                <div className="num">{m.module_id.replace(/^gt-/, "")}</div>
+                <div>
+                  <div className="title">{m.title}</div>
+                  <div className="sub">{m.subtitle}</div>
+                  <div className="tiny muted" style={{ marginTop: 4 }}>
+                    {m.via_admin ? "Admin preview · " : ""}
+                    {completed > 0 ? `${completed} section${completed === 1 ? "" : "s"} complete` : "Not started"}
+                    {ps.summative_score ? ` · summative ${ps.summative_score}` : ""}
+                  </div>
+                </div>
+                <div className={`status ${completed > 0 ? "available" : ""}`}>
+                  Open ↗
+                </div>
+              </div>
+            </a>
+          );
+        })}
+        <div className="btn-row" style={{ marginTop: 16 }}>
+          <button className="btn btn-ghost" onClick={onBack}>← Back</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -510,6 +574,17 @@ function Overview({ progress, onOpenSection, onOpenCalculator, onOpenQuiz, onOpe
         </div>
       </div>
 
+      {completed >= SECTIONS.length && (
+        <div className="card" style={{ borderColor: "var(--good)", background: "rgba(74,222,128,.04)" }}>
+          <h3>Module complete — continue to GT-06</h3>
+          <p className="muted small">You've finished all {SECTIONS.length} sections of GT-05. The next module in the Small Jet Engine Design Training is <b>GT-06 — Evaporative Tube Combustor</b>, which builds directly on the P3, T3, and ṁ_air outputs you just computed.</p>
+          <div className="btn-row">
+            <a href="https://smallgasturbine.gt-06.proreadyengineer.com/" target="_blank" rel="noopener noreferrer" className="btn btn-primary" style={{ textDecoration: "none" }}>
+              Continue to GT-06 →
+            </a>
+          </div>
+        </div>
+      )}
       <div className="card">
         <h3>Tools</h3>
         <p className="muted small">Reach for these any time during the module.</p>

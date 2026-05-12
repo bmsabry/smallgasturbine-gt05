@@ -90,3 +90,9 @@ export async function adminGrantAccessRequest(userId) {
 export async function adminDenyAccessRequest(userId) {
   return request(`/learning/${MODULE_ID}/access-requests/${userId}/deny`, { method: "POST" });
 }
+
+
+// ─── cross-module (not module-scoped) ────────────────────────────────
+export async function fetchMyModules() {
+  return request("/learning/my-modules");
+}
